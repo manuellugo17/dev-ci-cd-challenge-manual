@@ -113,7 +113,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            cd ~/app
+            cd ~/challenge/app
 
             echo "Cargando nueva imagen Docker..."
             docker load -i app-image.tar
@@ -159,7 +159,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            cd ~/app
+            cd ~/challenge/app
 
             echo "Guardando imagen actual como backup para rollback..."
             docker tag dev-cicd-challenge:production \
@@ -169,7 +169,7 @@ jobs:
             docker tag dev-cicd-challenge:${{ github.sha }} \
               dev-cicd-challenge:production
 
-            echo "SHA desplegado: ${{ github.sha }}" > ~/app/rollback/last-sha.txt
+            echo "SHA desplegado: ${{ github.sha }}" > ~/challenge/app/rollback/last-sha.txt
 
             docker compose stop production   || true
             docker compose rm -f production  || true
@@ -201,7 +201,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            cd ~/app
+            cd ~/challenge/app
             echo "INICIANDO ROLLBACK..."
 
             docker tag dev-cicd-challenge:rollback \
