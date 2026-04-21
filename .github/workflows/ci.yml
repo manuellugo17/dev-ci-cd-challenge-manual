@@ -8,7 +8,7 @@ on:
 jobs:
 
   # ══════════════════════════════════════════
-  # JOB 1 — Instalar dependencias y correr tests
+  # JOB 1 — Tests (corre en GitHub)
   # ══════════════════════════════════════════
   test:
     name: Run Tests
@@ -32,7 +32,6 @@ jobs:
         env:
           APP_ENV: test
 
-      # Si los tests fallan, guardamos el log para el AI Resolver
       - name: Guardar log de falla
         if: failure()
         run: |
@@ -47,12 +46,13 @@ jobs:
           path: logs/
 
   # ══════════════════════════════════════════
-  # JOB 2 — Construir imagen Docker
+  # JOB 2 — Build y Deploy Staging
+  # (corre directo en tu VM via self-hosted runner)
   # ══════════════════════════════════════════
-  build:
-    name: Build Docker Image
+  deploy-staging:
+    name: Deploy to Staging
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
 
       - name: Descargar el código
@@ -64,161 +64,101 @@ jobs:
       - name: Probar que el contenedor arranca bien
         run: |
           docker run -d \
-            --name prueba-container \
-            -p 3001:3001 \
+            --name prueba-${{ github.sha }} \
+            -p 3099:3001 \
             -e APP_ENV=test \
             -e PORT=3001 \
             dev-cicd-challenge:${{ github.sha }}
           sleep 4
-          curl -f http://localhost:3001/health
-          docker stop prueba-container
-          docker rm prueba-container
+          curl -f http://localhost:3099/health
+          docker stop prueba-${{ github.sha }}
+          docker rm prueba-${{ github.sha }}
 
-      - name: Guardar imagen como archivo .tar
-        run: docker save dev-cicd-challenge:${{ github.sha }} -o app-image.tar
-
-      - name: Subir imagen como artefacto
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: app-image.tar
-
-  # ══════════════════════════════════════════
-  # JOB 3 — Deploy a Staging en tu VM
-  # ══════════════════════════════════════════
-  deploy-staging:
-    name: Deploy to Staging
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-
-      - name: Descargar imagen Docker
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-
-      - name: Copiar imagen a la VM por SCP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          source: app-image.tar
-          target: /home/${{ secrets.VM_USER }}/app/
-
-      - name: Deployar staging en la VM por SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            cd ~/challenge/app
-
-            echo "Cargando nueva imagen Docker..."
-            docker load -i app-image.tar
-
-            echo "Taggeando como staging..."
-            docker tag dev-cicd-challenge:${{ github.sha }} dev-cicd-challenge:staging
-
-            echo "Reiniciando contenedor staging..."
-            docker compose stop staging   || true
-            docker compose rm -f staging  || true
-            docker compose up -d staging
-
-            echo "Staging deployado OK"
-
-      - name: Esperar que staging arranque
-        run: sleep 10
-
-      - name: Smoke test — verificar que staging responde
+      - name: Taggear como staging
         run: |
-          echo "Probando ${{ secrets.STAGING_URL }}/health ..."
+          docker tag dev-cicd-challenge:${{ github.sha }} \
+            dev-cicd-challenge:staging
+
+      - name: Reiniciar contenedor staging
+        run: |
+          cd ~/challenge/app
+          docker compose stop staging  || true
+          docker compose rm -f staging || true
+          docker compose up -d staging
+          echo "Staging deployado OK"
+
+      - name: Smoke test staging
+        run: |
+          sleep 5
           response=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.STAGING_URL }}/health")
-          echo "Respuesta HTTP: $response"
+            http://localhost:3001/health)
+          echo "Staging respondió HTTP $response"
           if [ "$response" != "200" ]; then
-            echo "SMOKE TEST FALLIDO — staging devolvió HTTP $response"
+            echo "SMOKE TEST FALLIDO"
             exit 1
           fi
           echo "SMOKE TEST OK"
 
   # ══════════════════════════════════════════
-  # JOB 4 — Deploy a Producción + Rollback automático
+  # JOB 3 — Deploy Producción + Rollback
+  # (corre directo en tu VM via self-hosted runner)
   # ══════════════════════════════════════════
   deploy-production:
     name: Deploy to Production
     needs: deploy-staging
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
 
-      - name: Deployar producción en la VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            cd ~/challenge/app
+      - name: Guardar versión anterior para rollback
+        run: |
+          docker tag dev-cicd-challenge:production \
+            dev-cicd-challenge:rollback 2>/dev/null || true
 
-            echo "Guardando imagen actual como backup para rollback..."
-            docker tag dev-cicd-challenge:production \
-              dev-cicd-challenge:rollback 2>/dev/null || true
+      - name: Activar nueva versión en producción
+        run: |
+          docker tag dev-cicd-challenge:${{ github.sha }} \
+            dev-cicd-challenge:production
+          echo "${{ github.sha }}" > ~/challenge/app/rollback/last-sha.txt
 
-            echo "Activando nueva versión en producción..."
-            docker tag dev-cicd-challenge:${{ github.sha }} \
-              dev-cicd-challenge:production
+      - name: Reiniciar contenedor producción
+        run: |
+          cd ~/challenge/app
+          docker compose stop production  || true
+          docker compose rm -f production || true
+          docker compose up -d production
+          echo "Producción deployada OK"
 
-            echo "SHA desplegado: ${{ github.sha }}" > ~/challenge/app/rollback/last-sha.txt
-
-            docker compose stop production   || true
-            docker compose rm -f production  || true
-            docker compose up -d production
-
-            echo "Producción deployada OK"
-
-      - name: Esperar que producción arranque
-        run: sleep 10
-
-      - name: Health check — verificar que producción responde
+      - name: Health check producción
         id: healthcheck
         run: |
-          echo "Probando ${{ secrets.PROD_URL }}/health ..."
+          sleep 5
           response=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.PROD_URL }}/health")
-          echo "Respuesta HTTP: $response"
+            http://localhost:3002/health)
+          echo "Producción respondió HTTP $response"
           if [ "$response" != "200" ]; then
-            echo "HEALTH CHECK FALLIDO — producción devolvió HTTP $response"
+            echo "HEALTH CHECK FALLIDO"
             exit 1
           fi
-          echo "HEALTH CHECK OK — producción funcionando"
+          echo "HEALTH CHECK OK"
 
-      - name: Rollback automático si el health check falló
+      - name: Rollback automático si falló
         if: failure()
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            cd ~/challenge/app
-            echo "INICIANDO ROLLBACK..."
-
-            docker tag dev-cicd-challenge:rollback \
-              dev-cicd-challenge:production 2>/dev/null || true
-
-            docker compose stop production   || true
-            docker compose rm -f production  || true
-            docker compose up -d production
-
-            echo "ROLLBACK COMPLETADO"
+        run: |
+          echo "INICIANDO ROLLBACK..."
+          cd ~/challenge/app
+          docker tag dev-cicd-challenge:rollback \
+            dev-cicd-challenge:production 2>/dev/null || true
+          docker compose stop production  || true
+          docker compose rm -f production || true
+          docker compose up -d production
+          echo "ROLLBACK COMPLETADO"
 
   # ══════════════════════════════════════════
-  # JOB 5 — AI Resolver (solo si algo falló)
+  # JOB 4 — AI Resolver (solo si algo falló)
   # ══════════════════════════════════════════
   ai-resolver:
     name: AI Incident Resolver
-    needs: [test, build, deploy-staging, deploy-production]
+    needs: [test, deploy-staging, deploy-production]
     if: failure()
     runs-on: ubuntu-latest
     steps:
@@ -231,7 +171,7 @@ jobs:
         with:
           node-version: 20
 
-      - name: Descargar logs de falla (si existen)
+      - name: Descargar logs de falla
         uses: actions/download-artifact@v4
         with:
           name: failure-logs
@@ -243,13 +183,13 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
-      - name: Subir reporte de incidente
+      - name: Subir reporte
         uses: actions/upload-artifact@v4
         with:
           name: incident-report
           path: artifacts/
 
-      - name: Comentar reporte en el PR (si aplica)
+      - name: Comentar en PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
