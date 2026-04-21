@@ -1,0 +1,268 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+
+  # ══════════════════════════════════════════
+  # JOB 1 — Instalar dependencias y correr tests
+  # ══════════════════════════════════════════
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Correr los tests
+        run: npm test
+        env:
+          APP_ENV: test
+
+      # Si los tests fallan, guardamos el log para el AI Resolver
+      - name: Guardar log de falla
+        if: failure()
+        run: |
+          mkdir -p logs
+          npm test 2>&1 | tee logs/pipeline_failure.log || true
+
+      - name: Subir log como artefacto
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: logs/
+
+  # ══════════════════════════════════════════
+  # JOB 2 — Construir imagen Docker
+  # ══════════════════════════════════════════
+  build:
+    name: Build Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Construir imagen Docker
+        run: docker build -t dev-cicd-challenge:${{ github.sha }} .
+
+      - name: Probar que el contenedor arranca bien
+        run: |
+          docker run -d \
+            --name prueba-container \
+            -p 3001:3001 \
+            -e APP_ENV=test \
+            -e PORT=3001 \
+            dev-cicd-challenge:${{ github.sha }}
+          sleep 4
+          curl -f http://localhost:3001/health
+          docker stop prueba-container
+          docker rm prueba-container
+
+      - name: Guardar imagen como archivo .tar
+        run: docker save dev-cicd-challenge:${{ github.sha }} -o app-image.tar
+
+      - name: Subir imagen como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: app-image.tar
+
+  # ══════════════════════════════════════════
+  # JOB 3 — Deploy a Staging en tu VM
+  # ══════════════════════════════════════════
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Descargar imagen Docker
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Copiar imagen a la VM por SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: app-image.tar
+          target: /home/${{ secrets.VM_USER }}/app/
+
+      - name: Deployar staging en la VM por SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/app
+
+            echo "Cargando nueva imagen Docker..."
+            docker load -i app-image.tar
+
+            echo "Taggeando como staging..."
+            docker tag dev-cicd-challenge:${{ github.sha }} dev-cicd-challenge:staging
+
+            echo "Reiniciando contenedor staging..."
+            docker compose stop staging   || true
+            docker compose rm -f staging  || true
+            docker compose up -d staging
+
+            echo "Staging deployado OK"
+
+      - name: Esperar que staging arranque
+        run: sleep 10
+
+      - name: Smoke test — verificar que staging responde
+        run: |
+          echo "Probando ${{ secrets.STAGING_URL }}/health ..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.STAGING_URL }}/health")
+          echo "Respuesta HTTP: $response"
+          if [ "$response" != "200" ]; then
+            echo "SMOKE TEST FALLIDO — staging devolvió HTTP $response"
+            exit 1
+          fi
+          echo "SMOKE TEST OK"
+
+  # ══════════════════════════════════════════
+  # JOB 4 — Deploy a Producción + Rollback automático
+  # ══════════════════════════════════════════
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Deployar producción en la VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/app
+
+            echo "Guardando imagen actual como backup para rollback..."
+            docker tag dev-cicd-challenge:production \
+              dev-cicd-challenge:rollback 2>/dev/null || true
+
+            echo "Activando nueva versión en producción..."
+            docker tag dev-cicd-challenge:${{ github.sha }} \
+              dev-cicd-challenge:production
+
+            echo "SHA desplegado: ${{ github.sha }}" > ~/app/rollback/last-sha.txt
+
+            docker compose stop production   || true
+            docker compose rm -f production  || true
+            docker compose up -d production
+
+            echo "Producción deployada OK"
+
+      - name: Esperar que producción arranque
+        run: sleep 10
+
+      - name: Health check — verificar que producción responde
+        id: healthcheck
+        run: |
+          echo "Probando ${{ secrets.PROD_URL }}/health ..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.PROD_URL }}/health")
+          echo "Respuesta HTTP: $response"
+          if [ "$response" != "200" ]; then
+            echo "HEALTH CHECK FALLIDO — producción devolvió HTTP $response"
+            exit 1
+          fi
+          echo "HEALTH CHECK OK — producción funcionando"
+
+      - name: Rollback automático si el health check falló
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/app
+            echo "INICIANDO ROLLBACK..."
+
+            docker tag dev-cicd-challenge:rollback \
+              dev-cicd-challenge:production 2>/dev/null || true
+
+            docker compose stop production   || true
+            docker compose rm -f production  || true
+            docker compose up -d production
+
+            echo "ROLLBACK COMPLETADO"
+
+  # ══════════════════════════════════════════
+  # JOB 5 — AI Resolver (solo si algo falló)
+  # ══════════════════════════════════════════
+  ai-resolver:
+    name: AI Incident Resolver
+    needs: [test, build, deploy-staging, deploy-production]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Descargar logs de falla (si existen)
+        uses: actions/download-artifact@v4
+        with:
+          name: failure-logs
+          path: logs/
+        continue-on-error: true
+
+      - name: Correr el AI Resolver
+        run: node scripts/ai-resolver.js
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Subir reporte de incidente
+        uses: actions/upload-artifact@v4
+        with:
+          name: incident-report
+          path: artifacts/
+
+      - name: Comentar reporte en el PR (si aplica)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const report = fs.readFileSync('artifacts/incident_report.md', 'utf8');
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## 🤖 AI Incident Report\n\n${report}`
+              });
+            } catch(e) {
+              console.log('No se pudo comentar:', e.message);
+            }
