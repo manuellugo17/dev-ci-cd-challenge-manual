@@ -286,3 +286,4 @@ No es necesario completar todo si el tiempo no alcanza.
 
 Valoramos mucho **explicar decisiones técnicas** en el README.
 
+
